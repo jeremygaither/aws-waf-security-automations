@@ -22,14 +22,16 @@ from urllib.parse import unquote_plus
 from urllib.request import Request, urlopen
 from os import environ
 from ipaddress import ip_address
+import random
 
 logging.getLogger().debug('Loading function')
 
 #======================================================================================================================
 # Constants
 #======================================================================================================================
-API_CALL_NUM_RETRIES = 3
-BLOCK_ERROR_CODES = ['400','403','404','405'] # error codes to parse logs for
+API_CALL_NUM_RETRIES = 8
+API_CALL_MAX_DELAY = 30
+BLOCK_ERROR_CODES = ['400','401','403','404','405'] # error codes to parse logs for
 OUTPUT_FILE_NAME = environ['STACK_NAME'] + '.json'
 
 # CloudFront Access Logs
@@ -52,6 +54,7 @@ LINE_FORMAT_ALB = {
 
 REQUEST_COUNTER_INDEX = 0
 ERROR_COUNTER_INDEX = 1
+GET_TOKEN_COUNTER_INDEX = 2
 
 waf = None
 
@@ -101,15 +104,18 @@ def get_outstanding_requesters(bucket_name, key_name):
                     if request_key in result.keys():
                         result[request_key][REQUEST_COUNTER_INDEX] += 1
                     else:
-                        result[request_key] = [1,0]
+                        result[request_key] = [1,0,0]
 
                     if line_data[return_code_index] in BLOCK_ERROR_CODES:
                         result[request_key][ERROR_COUNTER_INDEX] += 1
+                    
+                    if '/api/auth/gettoken' in line.lower():
+                        result[request_key][GET_TOKEN_COUNTER_INDEX] += 1
 
                     num_requests += 1
 
                 except Exception as e:
-                    logging.getLogger().error("[get_outstanding_requesters] \t\tError to process line: %s"%line)
+                    logging.getLogger().error("[get_outstanding_requesters] \t\tError to process line: %s\t\t%s" % (line, e))
 
         #--------------------------------------------------------------------------------------------------------------
         logging.getLogger().info("[get_outstanding_requesters] \tKeep only outstanding requesters")
@@ -119,15 +125,21 @@ def get_outstanding_requesters(bucket_name, key_name):
             k = k.split('-')[-1]
             error_exceeded = ('ERROR_PER_MINUTE_LIMIT' in environ and int(environ['ERROR_PER_MINUTE_LIMIT']) >= 0 and v[ERROR_COUNTER_INDEX] > int(environ['ERROR_PER_MINUTE_LIMIT']))
             req_exceeded = ('REQUEST_PER_MINUTE_LIMIT' in environ and int(environ['REQUEST_PER_MINUTE_LIMIT']) >= 0 and v[REQUEST_COUNTER_INDEX] > int(environ['REQUEST_PER_MINUTE_LIMIT']))
+            get_token_exceeded = ('GET_TOKEN_PER_MINUTE_LIMIT' in environ and int(environ['GET_TOKEN_PER_MINUTE_LIMIT']) >= 0 and v[GET_TOKEN_COUNTER_INDEX] > int(environ['GET_TOKEN_PER_MINUTE_LIMIT']))
 
-            if req_exceeded or error_exceeded:
+            if req_exceeded or error_exceeded or get_token_exceeded:
                 if k not in outstanding_requesters['block'].keys() or (
                         outstanding_requesters['block'][k]['max_req_per_min'] < v[REQUEST_COUNTER_INDEX] or
-                        outstanding_requesters['block'][k]['max_err_per_min'] < v[ERROR_COUNTER_INDEX]
+                        outstanding_requesters['block'][k]['max_err_per_min'] < v[ERROR_COUNTER_INDEX] or
+                        outstanding_requesters['block'][k]['max_get_token_per_min'] < v[GET_TOKEN_COUNTER_INDEX]
                     ):
+                    logging.getLogger().info("[get_outstanding_requesters] \t\Adding BLOCK %s"%k)
+                    if outstanding_requesters['block'][k]['max_get_token_per_min'] < v[GET_TOKEN_COUNTER_INDEX]:
+                        logging.getLogger().info("[get_outstanding_requesters] \t\BLOCK GetToken %s %d" % (k, v[GET_TOKEN_COUNTER_INDEX]))
                     outstanding_requesters['block'][k] = {
                         'max_req_per_min': v[REQUEST_COUNTER_INDEX],
                         'max_err_per_min': v[ERROR_COUNTER_INDEX],
+                        'max_get_token_per_min': v[GET_TOKEN_COUNTER_INDEX],
                         'updated_at': now_timestamp_str
                     }
 
@@ -173,10 +185,14 @@ def merge_current_blocked_requesters(key_name, outstanding_requesters):
 
     for k, v in remote_outstanding_requesters['block'].items():
         try:
+            if 'max_get_token_per_min' not in v:
+                v['max_get_token_per_min'] = 0
+            
             error_exceeded = ('ERROR_PER_MINUTE_LIMIT' in environ and int(environ['ERROR_PER_MINUTE_LIMIT']) >= 0 and v['max_err_per_min'] > int(environ['ERROR_PER_MINUTE_LIMIT']))
             req_exceeded = ('REQUEST_PER_MINUTE_LIMIT' in environ and int(environ['REQUEST_PER_MINUTE_LIMIT']) >= 0 and v['max_req_per_min'] > int(environ['REQUEST_PER_MINUTE_LIMIT']))
+            get_token_exceeded = ('GET_TOKEN_PER_MINUTE_LIMIT' in environ and int(environ['GET_TOKEN_PER_MINUTE_LIMIT']) >= 0 and v['max_get_token_per_min'] > int(environ['GET_TOKEN_PER_MINUTE_LIMIT']))
 
-            if req_exceeded or error_exceeded:
+            if req_exceeded or error_exceeded or get_token_exceeded:
                 if k in outstanding_requesters['block'].keys():
                     logging.getLogger().info("[merge_current_blocked_requesters] \t\tUpdating data of BLOCK %s rule"%k)
                     outstanding_requesters['block'][k]['updated_at'] = now_timestamp_str
@@ -184,6 +200,8 @@ def merge_current_blocked_requesters(key_name, outstanding_requesters):
                         outstanding_requesters['block'][k]['max_req_per_min'] = v['max_req_per_min']
                     if v['max_err_per_min'] > outstanding_requesters['block'][k]['max_err_per_min']:
                         outstanding_requesters['block'][k]['max_err_per_min'] = v['max_err_per_min']
+                    if v['max_get_token_per_min'] > outstanding_requesters['block'][k]['max_get_token_per_min']:
+                        outstanding_requesters['block'][k]['max_get_token_per_min'] = v['max_get_token_per_min']
 
                 else:
                     prev_updated_at = datetime.datetime.strptime(v['updated_at'], "%Y-%m-%d %H:%M:%S")
@@ -231,7 +249,8 @@ def waf_get_ip_set(ip_set_id):
             response = waf.get_ip_set(IPSetId=ip_set_id)
         except Exception as error:
             logging.getLogger().error(str(error))
-            delay = math.pow(2, attempt)
+            max_delay = math.pow(2, attempt)
+            delay = random.randint(1, min(API_CALL_MAX_DELAY, max_delay))
             logging.getLogger().info("[waf_get_ip_set] Retrying in %d seconds..." % (delay))
             time.sleep(delay)
         else:
@@ -254,7 +273,8 @@ def waf_update_ip_set(ip_set_id, updates_list):
                     Updates=updates_list)
             except Exception as error:
                 logging.getLogger().error(str(error))
-                delay = math.pow(2, attempt)
+                max_delay = math.pow(2, attempt)
+                delay = random.randint(1, min(API_CALL_MAX_DELAY, max_delay))
                 logging.getLogger().info("[waf_update_ip_set] Retrying in %d seconds..." % (delay))
                 time.sleep(delay)
             else:
